@@ -19,20 +19,20 @@ if !hVDA {
  * ===== GLOBALS ===== 
  * =================== */
 
-*<+#f23:: ; Copilot key opens Flow Launcher.
+*<+#f23:: ; Copilot key opens Raycast using its default Alt+Space hotkey.
 {
     Send "{Blind}{LShift up}{LWin up}" ; Releases the modifiers left stuck by the physical key.
-    Send "^+!f"                        ; Sends Ctrl+Shift+Alt+F (Ensure this is set in Flow Launcher!).
+    Send "!{Space}"
 }
+
 
 
 /* ================ 
  * ===== APPS =====
  * ================ */
 
-#Enter::run "wt.exe"     ; Win+Enter: Terminal
-#b::run "zen.exe"        ; Win+B: Browser
-#c::run "codium.exe"     ; Win+C: VSCodium
+#Enter::Run "wt.exe"                     ; Win+Enter: Terminal
+#b::Run "https://www.google.com/"       ; Win+B: Opens the Windows default browser.
 
 
 /* ============================= 
@@ -72,7 +72,7 @@ if !hVDA {
     }
 }
 
-!Space:: ; Alt + Space: Toggles "Always on Top" for the active window.
+#+t:: ; Win + Shift + T: Toggles "Always on Top" for the active window.
 {
     if WinExist("A") {
         WinSetAlwaysOnTop -1, "A"
@@ -157,15 +157,11 @@ ResizeWindow(direction) {
     SendMessage 0x0232, 0, 0,, activeHwnd 
 }
 
-; Disables Win + Shift + Up/Down (Native vertical maximization).
-#+Up::return
-#+Down::return
-
-; Win + Arrows: Changes focus to the window on the Right/Left/Up/Down and centers the mouse.
-$#Left::FocusAndCenter("Left")
-$#Right::FocusAndCenter("Right")
-$#Up::FocusAndCenter("Up")
-$#Down::FocusAndCenter("Down")
+; Win + Arrows belong to Windows Snap. Use Win + Alt + H/J/K/L for directional focus.
+#!h::FocusAndCenter("Left")
+#!l::FocusAndCenter("Right")
+#!k::FocusAndCenter("Up")
+#!j::FocusAndCenter("Down")
 
 FocusAndCenter(direction) {
     activeHwnd := WinExist("A")
@@ -228,31 +224,31 @@ FocusAndCenter(direction) {
  * ===== DESKTOP MANAGEMENT ===== 
  * ============================== */
 
-; Disables Ctrl + Win + Right/Left (Native Windows desktop switching).
-#^Left::return
-#^Right::return
-
 ; Defines the functions communicating with the DLL.
 GetDesktopCount() => DllCall("VirtualDesktopAccessor\GetDesktopCount", "Int")
 GoToDesktopNumber(num) => DllCall("VirtualDesktopAccessor\GoToDesktopNumber", "Int", num)
 CreateDesktop() => DllCall("VirtualDesktopAccessor\CreateDesktop")
-RemoveDesktop(num) => DllCall("VirtualDesktopAccessor\RemoveDesktop", "Int", num)
+RemoveDesktop(num, fallbackNum) => DllCall("VirtualDesktopAccessor\RemoveDesktop", "Int", num, "Int", fallbackNum, "Int")
 GetCurrentDesktopNumber() => DllCall("VirtualDesktopAccessor\GetCurrentDesktopNumber", "Int")
+GetWindowDesktopNumber(hWnd) => DllCall("VirtualDesktopAccessor\GetWindowDesktopNumber", "Ptr", hWnd, "Int")
+IsWindowOnDesktopNumber(hWnd, num) => DllCall("VirtualDesktopAccessor\IsWindowOnDesktopNumber", "Ptr", hWnd, "Int", num, "Int")
 MoveWindowToDesktopNumber(hWnd, num) => DllCall("VirtualDesktopAccessor\MoveWindowToDesktopNumber", "Ptr", hWnd, "Int", num)
-IsWindowOnCurrentVirtualDesktop(hWnd) => DllCall("VirtualDesktopAccessor\IsWindowOnCurrentVirtualDesktop", "Ptr", hWnd, "Int")
+IsPinnedWindow(hWnd) => DllCall("VirtualDesktopAccessor\IsPinnedWindow", "Ptr", hWnd, "Int")
+IsPinnedApp(hWnd) => DllCall("VirtualDesktopAccessor\IsPinnedApp", "Ptr", hWnd, "Int")
 
 ; Creates shortcuts from Win+1 to Win+9 to switch to desktops 1 through 9.
 Loop 9 {
     ; Passes A_Index - 1 because the DLL counts desktops starting from 0 (e.g., Desktop 1 = Index 0).
-    Hotkey "#" . A_Index, SwitchToDesktop.Bind(A_Index - 1) ; A_Index represents the current iteration value.
+    Hotkey "$#" . A_Index, SwitchToDesktop.Bind(A_Index - 1) ; Use the hook so Windows does not also activate taskbar app 1-9.
 }
 
-; Creates shortcuts from Win+1 to Win+9 to move windows to desktops 1 through 9.
+; Creates shortcuts from Win+Shift+1 to Win+Shift+9 to move the focused window.
 Loop 9 {
-    Hotkey "<+#" . A_Index, MoveToDesktop.Bind(A_Index - 1)
+    Hotkey "$<+#" . A_Index, MoveToDesktop.Bind(A_Index - 1)
 }
 
 SwitchToDesktop(targetIndex, *) { ; Handles movement between desktops.
+    previousIndex := GetCurrentDesktopNumber()
     currentCount := GetDesktopCount()
     
     while (targetIndex >= currentCount) {
@@ -266,65 +262,83 @@ SwitchToDesktop(targetIndex, *) { ; Handles movement between desktops.
     ; Waits for the Windows animation.
     Sleep 200 
     
-    ; Calls the function to activate the foreground app.
-    FocusTopWindow()
+    ; Windows manages the active window during the switch. Forcing WinActivate
+    ; here can make its taskbar button flash during the desktop animation.
+
+    ; Win+9 may create desktops 2-9. Drop unused trailing ones when returning to a lower desktop.
+    if (targetIndex < previousIndex)
+        TrimEmptyTrailingDesktops()
 }
 
-MoveToDesktop(targetIndex, *) { ; Moves the window and follows it to the new desktop.
-    hwnd := WinExist("A")
-    if hwnd {
-        currentCount := GetDesktopCount()
-        while (targetIndex >= currentCount) {
-            CreateDesktop()
-            Sleep 50 
-            currentCount := GetDesktopCount()
-        }
-        
-        WinMinimize "ahk_id " hwnd
+TrimEmptyTrailingDesktops() {
+    ; Only remove desktops above the current one: deleting an empty desktop in the
+    ; middle would renumber workspaces that still contain windows.
+    while (count := GetDesktopCount()) > GetCurrentDesktopNumber() + 1 {
+        lastIndex := count - 1
+        if DesktopHasWindows(lastIndex)
+            break
+
+        if (RemoveDesktop(lastIndex, lastIndex - 1) = -1)
+            break
         Sleep 50
-        MoveWindowToDesktopNumber(hwnd, targetIndex)
-        GoToDesktopNumber(targetIndex) 
-        Sleep 250
-        WinRestore "ahk_id " hwnd
-        
-        FocusTopWindow() ; Restores focus cleanly here as well.
+        if (GetDesktopCount() >= count)
+            break
     }
 }
 
-FocusTopWindow() { ; Focus function
-    ; WinGetList returns windows in order from most recent to oldest.
-    for hwnd in WinGetList() {
-        ; Ignores invisible and system-hidden windows.
-        if !(WinGetStyle(hwnd) & 0x10000000) 
-            continue
-            
-        ; Filter to ignore the taskbar, backgrounds, and empty processes.
-        winClass := WinGetClass(hwnd)
-        if (winClass = "Shell_TrayWnd" || winClass = "Shell_SecondaryTrayWnd" || winClass = "Progman" || winClass = "WorkerW" || WinGetTitle(hwnd) = "")
-            continue
-            
-        ; Checks if this window is located on the current desktop.
-        if IsWindowOnCurrentVirtualDesktop(hwnd) {
-            ; Found! Being the first in the list, it is the last one used.
-            WinActivate hwnd
-            
-            ; Moves the mouse exactly to the center of this window.
-            WinGetPos ,, &tw, &th, hwnd
-            CoordMode "Mouse", "Window"
-            MouseMove tw/2, th/2, 0 
-            
-            ; Sends an empty Esc to close the taskbar if it is set to auto-hide.
-            Send "{Esc}" 
-            return ; Exits the function; the operation is complete.
+DesktopHasWindows(desktopIndex) {
+    ; Windows on other virtual desktops can be hidden/cloaked. WinGetList with
+    ; its default hidden-window setting missed them and deleted occupied desktops.
+    previousSetting := A_DetectHiddenWindows
+    DetectHiddenWindows true
+    try {
+        for hwnd in WinGetList() {
+            winClass := WinGetClass(hwnd)
+            if (winClass = "Shell_TrayWnd" || winClass = "Shell_SecondaryTrayWnd" || winClass = "Progman" || winClass = "WorkerW")
+                continue
+            ; Check every window, including hidden, minimized, and untitled ones.
+            windowDesktop := GetWindowDesktopNumber(hwnd)
+            if (windowDesktop = desktopIndex || (windowDesktop = -1 && IsWindowOnDesktopNumber(hwnd, desktopIndex) = 1))
+                return true
         }
+    } catch {
+        ; If a window disappears during the scan or the DLL fails, do not delete.
+        return true
+    } finally {
+        DetectHiddenWindows previousSetting
     }
-    
-    ; If execution reaches this point, the desktop is COMPLETELY EMPTY.
-    ; Clicks empty screen space to remove focus from nothingness and hide the taskbar.
-    CoordMode "Mouse", "Screen"
-    MouseGetPos &mx, &my
-    MouseClick "Left", 1, 1, 1, 0
-    MouseMove mx, my, 0
+    return false
+}
+
+MoveToDesktop(targetIndex, *) { ; Moves only the focused window and follows it.
+    sourceIndex := GetCurrentDesktopNumber()
+    if (sourceIndex = targetIndex)
+        return
+
+    hwnd := WinExist("A")
+    if !hwnd || GetWindowDesktopNumber(hwnd) != sourceIndex
+        return
+    ; A pinned window is already visible on every desktop.
+    if (IsPinnedWindow(hwnd) != 0 || IsPinnedApp(hwnd) != 0)
+        return
+
+    currentCount := GetDesktopCount()
+    while (targetIndex >= currentCount) {
+        if (CreateDesktop() = -1)
+            return
+        Sleep 50
+        currentCount := GetDesktopCount()
+    }
+
+    if (MoveWindowToDesktopNumber(hwnd, targetIndex) = -1)
+        return
+
+    GoToDesktopNumber(targetIndex)
+    Sleep 250
+    ; Windows brings the destination's window to the foreground itself.
+    ; Windows Snap keeps the window's layout on the destination desktop.
+    if (targetIndex < sourceIndex)
+        TrimEmptyTrailingDesktops()
 }
 
 /* --- Desktop Deletion Management ---
@@ -354,10 +368,8 @@ FocusTopWindow() { ; Focus function
         Sleep 100
         
         ; Deletes the desktop at currentIndex, which was the one before the switch.
-        RemoveDesktop(currentIndex)
+        RemoveDesktop(currentIndex, targetIndex)
         
-        ; Forces focus on the active window of the new desktop.
-        if WinExist("A")
-            WinActivate "A"
+        ; Let Windows restore focus without flashing a taskbar button.
     }
 }
